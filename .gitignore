@@ -1,0 +1,13 @@
+# HuggingFace token (criado em runtime pelo node)
+hf_node_config.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# IDE / workspace
+*.code-workspace
+
+# Temp files do downloader
+.hf_download_tmp_*
