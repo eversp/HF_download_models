@@ -165,19 +165,32 @@ class HFDownloader:
                 return category + "s"
         except Exception:
             pass
-        # Fallback mínimo (apenas nomes que fogem do padrão)
+        # Fallback completo — cobre TODAS as categorias que o frontend pode enviar
         FALLBACK = {
             "checkpoint": "checkpoints",
+            "checkpoints": "checkpoints",
             "lora": "loras",
+            "loras": "loras",
             "vae": "vae",
             "clip": "clip",
+            "text_encoders": "clip",
             "controlnet": "controlnet",
             "embeddings": "embeddings",
             "unet": "diffusion_models",
+            "diffusion_models": "diffusion_models",
             "upscaler": "upscale_models",
+            "upscale_models": "upscale_models",
             "ipadapter": "ipadapter",
+            "style_models": "style_models",
+            "clip_vision": "clip_vision",
+            "gligen": "gligen",
+            "photomaker": "photomaker",
+            "insightface": "insightface",
+            "animatediff_models": "animatediff_models",
+            "animatediff_motion_lora": "animatediff_motion_lora",
+            "hypernetwork": "embeddings",
         }
-        return FALLBACK.get(category, "checkpoints")
+        return FALLBACK.get(category, FALLBACK.get(category + "s", "checkpoints"))
 
     # --- Busca ---
     def search_models(self, query: str, limit: int = 20) -> List[ModelInfo]:
@@ -214,15 +227,43 @@ class HFDownloader:
             pass
         return results
 
+    def _score_candidate(self, repo_id: str, expected_filename: str) -> tuple:
+        """
+        Avalia um repositório candidato.
+        Retorna (score, filepath, file_size) onde:
+          score > 0 = viável, maior = melhor
+          score = 0 = falhou
+        """
+        try:
+            files = self._list_model_files(repo_id)
+            best_size = 0
+            best_file = None
+            for f in files:
+                for ext in ['.safetensors', '.ckpt', '.pt', '.pth', '.bin']:
+                    if f.lower().endswith(ext):
+                        size, _ = self._get_file_metadata(repo_id, f)
+                        if not self._is_pruned_path(f):
+                            if size > best_size:
+                                best_size = size
+                                best_file = f
+                        break
+
+            if best_file and best_size > 0:
+                # Score: tamanho em GB + bônus se nome do arquivo casa exatamente
+                score = best_size
+                if expected_filename and os.path.basename(best_file) == expected_filename:
+                    score += 1_000_000_000  # bônus enorme para match exato de filename
+                return (score, best_file, best_size)
+        except Exception:
+            pass
+        return (0, None, 0)
+
     def search_best_match(self, filename: str) -> Optional[str]:
         """
         Busca o melhor match para um filename no HuggingFace.
+        Agora com verificação de tamanho real do arquivo e preferência por modelos completos.
         
-        Estratégia em cascata:
-        1. Tenta busca exata com o nome completo (com versão)
-        2. Tenta sem a versão (ex: "x2-1.1" no final)
-        3. Tenta nome limpo com maior limite
-        4. Tenta forjar repo_id com autor conhecido
+        Retorna o repo_id do melhor candidato, ou None.
         """
         # Extrai nome base sem extensão
         base = filename
@@ -230,95 +271,113 @@ class HFDownloader:
             if base.lower().endswith(ext):
                 base = base[:-len(ext)]
                 break
-        
+
+        # Coleciona todos os candidatos com suas pontuações
+        candidates = []  # (model_id, score, filepath, file_size)
+
+        def _add_candidates(results_list):
+            """Adiciona candidatos da lista de resultados, avaliando cada um."""
+            for r in results_list:
+                score, fp, sz = self._score_candidate(r.model_id, filename)
+                if score > 0:
+                    candidates.append((r.model_id, score, fp, sz))
+                    size_gb = sz / 1024**3
+                    print(f"[HF Node]    Candidato: {r.model_id} | {os.path.basename(fp) if fp else '?'} | {size_gb:.1f}GB")
+
         # ── Estratégia 1: busca exata com o nome completo (top 10) ──
         results = self.search_models(filename, limit=10)
-        if results:
-            # Verifica se algum resultado tem o nome exato ou contém a versão
-            base_lower = base.lower().strip().replace('-', ' ').replace('_', ' ')
-            for r in results:
-                rname_lower = r.model_name.lower().replace('-', ' ').replace('_', ' ')
-                if base_lower in rname_lower or rname_lower in base_lower:
-                    print(f"[HF Node] ✅ Match exato encontrado: {r.model_id}")
-                    return r.model_id
-            # Se nenhum match exato, pega o primeiro (mais baixado)
-            print(f"[HF Node] ✅ Primeiro resultado: {results[0].model_id}")
-            return results[0].model_id
-        
+        base_lower = base.lower().strip().replace('-', ' ').replace('_', ' ')
+        filtered = [r for r in results if
+                     base_lower in r.model_name.lower().replace('-', ' ').replace('_', ' ') or
+                     r.model_name.lower().replace('-', ' ').replace('_', ' ') in base_lower]
+        if filtered:
+            _add_candidates(filtered)
+
         # ── Estratégia 2: tenta sem sufixo de versão ──
-        # Ex: "ltx-2.3-spatial-upscaler-x2-1.1" → "ltx-2.3-spatial-upscaler"
-        parts = base.rsplit('-', 1)
-        if len(parts) > 1:
-            # Verifica se a última parte parece versão (ex: "x2-1.1", "v2", "fp16")
-            maybe_version = parts[-1]
-            if any(c.isdigit() for c in maybe_version):
-                shorter = parts[0].strip()
-                results = self.search_models(shorter, limit=10)
+        if not candidates:
+            parts = base.rsplit('-', 1)
+            if len(parts) > 1 and any(c.isdigit() for c in parts[-1]):
+                results = self.search_models(parts[0].strip(), limit=10)
                 if results:
-                    print(f"[HF Node] ✅ Match sem versão: {results[0].model_id}")
-                    return results[0].model_id
-        
+                    _add_candidates(results)
+
         # ── Estratégia 3: busca mais ampla (top 30) ──
-        clean = base.replace('-', ' ').replace('_', ' ').strip()
-        results = self.search_models(clean, limit=30)
-        if results:
-            print(f"[HF Node] ✅ Match busca ampla: {results[0].model_id}")
-            return results[0].model_id
-        
+        if not candidates:
+            clean = base.replace('-', ' ').replace('_', ' ').strip()
+            results = self.search_models(clean, limit=30)
+            if results:
+                _add_candidates(results)
+
         # ── Estratégia 4: tenta forjar repo_id com autores conhecidos ──
-        # Autores comuns para certos tipos de modelo
         KNOWN_AUTHORS = {
-            'ltx': 'Lightricks',
-            'sdxl': 'stabilityai',
-            'sd': 'stabilityai',
-            'flux': 'black-forest-labs',
-            'wuerstchen': 'wurstmeister',
-            'deepfloyd': 'DeepFloyd',
-            'playground': 'playgroundai',
-            'pixart': 'PixArt-alpha',
-            'cogvideo': 'THUDM',
-            'animatediff': 'guoyww',
+            'ltx': 'Lightricks', 'sdxl': 'stabilityai', 'sd': 'stabilityai',
+            'flux': 'black-forest-labs', 'wuerstchen': 'wurstmeister',
+            'deepfloyd': 'DeepFloyd', 'playground': 'playgroundai',
+            'pixart': 'PixArt-alpha', 'cogvideo': 'THUDM', 'animatediff': 'guoyww',
         }
-        
-        # Pega a primeira palavra do nome base
-        first_word = base.split('-')[0].split('_')[0].lower()
-        if first_word in KNOWN_AUTHORS:
-            candidate = f"{KNOWN_AUTHORS[first_word]}/{base}"
-            # Verifica se o repo existe
-            try:
-                from huggingface_hub import repo_exists
-                if repo_exists(candidate, token=self._token):
-                    print(f"[HF Node] ✅ Repositório forjado existe: {candidate}")
-                    return candidate
-            except Exception:
-                pass
-            
-            # Tenta com o nome original também
-            candidate_orig = f"{KNOWN_AUTHORS[first_word]}/{filename}"
-            try:
-                from huggingface_hub import repo_exists
-                if repo_exists(candidate_orig, token=self._token):
-                    print(f"[HF Node] ✅ Repositório forjado (com ext): {candidate_orig}")
-                    return candidate_orig
-            except Exception:
-                pass
-        
+        if not candidates:
+            first_word = base.split('-')[0].split('_')[0].lower()
+            if first_word in KNOWN_AUTHORS:
+                for candidate in (f"{KNOWN_AUTHORS[first_word]}/{base}",
+                                  f"{KNOWN_AUTHORS[first_word]}/{filename}"):
+                    try:
+                        from huggingface_hub import repo_exists
+                        if repo_exists(candidate, token=self._token):
+                            score, fp, sz = self._score_candidate(candidate, filename)
+                            if score > 0:
+                                candidates.append((candidate, score, fp, sz))
+                    except Exception:
+                        pass
+
+        # ── Escolhe o melhor candidato: maior score = maior arquivo + bônus match exato ──
+        if candidates:
+            candidates.sort(key=lambda x: -x[1])  # maior score primeiro
+            best = candidates[0]
+            size_gb = best[3] / 1024**3
+            print(f"[HF Node] ✅ Melhor match: {best[0]} ({size_gb:.1f}GB, arquivo: {os.path.basename(best[2])})")
+            if size_gb < 0.5:
+                print(f"[HF Node] ⚠️  Modelo muito pequeno ({size_gb:.1f}GB) — pode estar incompleto!")
+            return best[0]
+
         print(f"[HF Node] ❌ Nenhum match encontrado para '{filename}'")
         return None
 
     # --- Download arquivo ÚNICO + renomeio ---
-    def _list_model_files(self, model_id: str) -> List[str]:
+    def _get_file_metadata(self, repo_id: str, filepath: str) -> tuple[int, str]:
+        """Obtém tamanho (bytes) e url de download de um arquivo no HF."""
         try:
-            return list_repo_files(model_id, token=self._token)
+            from huggingface_hub import get_hf_file_metadata, hf_hub_url
+            url = hf_hub_url(repo_id=repo_id, filename=filepath)
+            meta = get_hf_file_metadata(url, token=self._token)
+            return (meta.size or 0, url)
         except Exception:
-            return []
+            return (0, "")
+
+    @staticmethod
+    def _is_pruned_path(filepath: str) -> bool:
+        f_lower = filepath.lower()
+        pruned_kw = ['pruned', 'quantized', 'gguf', 'onnx', 'int8', 'int4', 'fp8']
+        return any(kw in f_lower for kw in pruned_kw)
 
     def _pick_model_file(self, files: List[str]) -> Optional[str]:
+        preferred = []
+        fallback = []
         for f in files:
             for ext in ['.safetensors', '.ckpt', '.pt', '.pth', '.bin']:
                 if f.lower().endswith(ext):
-                    return f
-        return None
+                    if self._is_pruned_path(f):
+                        fallback.append(f)
+                    else:
+                        preferred.append(f)
+                    break
+        return preferred[0] if preferred else (fallback[0] if fallback else None)
+
+    def _list_model_files(self, repo_id: str) -> List[str]:
+        """Lista arquivos de um repositório HF."""
+        try:
+            return list_repo_files(repo_id, token=self._token)
+        except Exception:
+            return []
 
     def download_single_file(self, model_id: str, expected_filename: str, destination_folder: str, 
                              repo_filepath: str = None, progress_callback=None,
@@ -565,9 +624,16 @@ class HFDownloader:
         except Exception:
             pass  # Não crítico — o modelo eventualmente aparece
 
-    def download_missing_model(self, missing: MissingModel, search_first: bool = True) -> str | None:
+    def download_missing_model(self, missing: MissingModel, search_first: bool = True,
+                                 progress_callback=None, cancel_event: threading.Event = None) -> str | None:
         """
         Baixa um modelo faltante. Retorna o caminho absoluto se sucesso, None se falha.
+        
+        Args:
+            missing: MissingModel com filename, category, comfy_folder, full_path
+            search_first: Se True, busca o model_id no HF antes de baixar
+            progress_callback: Função opcional chamada com (downloaded_bytes, total_bytes)
+            cancel_event: threading.Event — se setado, o download é abortado.
         """
         destination = str(self._comfyui_models_path / missing.comfy_folder)
 
@@ -579,7 +645,10 @@ class HFDownloader:
         else:
             model_id = missing.filename
 
-        return self.download_single_file(model_id, missing.filename, destination)
+        return self.download_single_file(
+            model_id, missing.filename, destination,
+            progress_callback=progress_callback, cancel_event=cancel_event,
+        )
 
     @staticmethod
     def parse_hf_url(url: str) -> Optional[dict]:

@@ -31,7 +31,8 @@ const NODE_CATEGORY = {
     "ControlNetLoader": "controlnet", "ControlNetLoaderAdvanced": "controlnet", "DiffControlNetLoader": "controlnet",
     "UpscaleModelLoader": "upscaler", "ImageUpscaleWithModel": "upscaler",
     "IPAdapterModelLoader": "ipadapter", "StyleModelLoader": "style_models",
-    "CLIPVisionLoader": "clip_vision", "GLIGENLoader": "gligen", "UNETLoader": "diffusion_models",
+    "CLIPVisionLoader": "clip_vision", "GLIGENLoader": "gligen",
+    "UNETLoader": "diffusion_models", "DiffusionModelLoader": "diffusion_models",
     "PhotoMakerLoader": "photomaker", "InsightFaceLoader": "insightface",
     "AnimateDiffLoader": "animatediff_models", "AnimateDiffLoaderV1": "animatediff_models",
     "AnimateDiffLoraLoader": "animatediff_motion_lora", "AnimateDiffMotionLoraLoader": "animatediff_motion_lora",
@@ -47,7 +48,8 @@ const NODE_WIDGETS = {
     "ControlNetLoader": ["control_net_name"], "ControlNetLoaderAdvanced": ["control_net_name"], "DiffControlNetLoader": ["control_net_name"],
     "UpscaleModelLoader": ["model_name"], "ImageUpscaleWithModel": ["model_name"],
     "IPAdapterModelLoader": ["model_name"], "StyleModelLoader": ["model_name"],
-    "CLIPVisionLoader": ["clip_name"], "GLIGENLoader": ["model_name"], "UNETLoader": ["unet_name"],
+    "CLIPVisionLoader": ["clip_name"], "GLIGENLoader": ["model_name"],
+    "UNETLoader": ["unet_name"], "DiffusionModelLoader": ["model_name", "unet_name"],
     "PhotoMakerLoader": ["model_name", "photomaker_model"], "InsightFaceLoader": ["model_name", "insightface"],
     "AnimateDiffLoader": ["model_name"], "AnimateDiffLoaderV1": ["model_name"],
     "AnimateDiffLoraLoader": ["lora_name"], "AnimateDiffMotionLoraLoader": ["lora_name"],
@@ -71,6 +73,7 @@ const extension = {
             // Timer do polling de download (cancelado se o nó for destruído)
             this._hfPollTimer = null;
             this._hfCurrentJobId = null;
+            this._hfProgressPercent = 0;
 
             // ════════════════════════════════════════════════
             // SEÇÃO: Download por URL Manual do HuggingFace
@@ -143,6 +146,34 @@ const extension = {
             return result;
         };
 
+        // ==================== BARRA DE PROGRESSO VISUAL ====================
+        const origOnDrawForeground = nodeType.prototype.onDrawForeground;
+        nodeType.prototype.onDrawForeground = function (ctx) {
+            const ret = origOnDrawForeground ? origOnDrawForeground.apply(this, arguments) : undefined;
+
+            const pct = this._hfProgressPercent;
+            if (pct > 0 && pct < 100) {
+                const w = this.size[0] - 20;
+                const h = 12;
+                const x = 10;
+                const y = this.size[1] - 20 - h;
+
+                ctx.fillStyle = "#2a2a2a";
+                ctx.fillRect(x, y, w, h);
+
+                ctx.fillStyle = pct < 50 ? "#1a73e8" : pct < 80 ? "#f0a500" : "#4caf50";
+                ctx.fillRect(x, y, w * (pct / 100), h);
+
+                ctx.fillStyle = "#eee";
+                ctx.font = "bold 10px monospace";
+                ctx.textAlign = "center";
+                ctx.textBaseline = "middle";
+                ctx.fillText(`${pct}%`, x + w / 2, y + h / 2);
+            }
+
+            return ret;
+        };
+
         // Limpa polling ao destruir nó
         const origOnRemoved = nodeType.prototype.onRemoved;
         nodeType.prototype.onRemoved = function () {
@@ -172,6 +203,7 @@ const extension = {
                 if (resp.ok) {
                     const data = await resp.json();
                     if (data.success) {
+                        this._hfProgressPercent = 0;
                         this._hfSetStatus("⛔ Download cancelado", "#f0a500");
                         this.title = "🤗 HF ⛔";
                         this.color = "#4a3a15"; this.bgcolor = "#3a2a10";
@@ -206,6 +238,7 @@ const extension = {
                 return;
             }
 
+            this._hfProgressPercent = 0;
             this._hfSetStatus("📥 Baixando via URL...", "#1a73e8");
 
             try {
@@ -244,7 +277,7 @@ const extension = {
                 }
                 this._hfPollTimer = setInterval(() => {
                     this._hfPollDownloadStatus(jobId);
-                }, 1500);
+                }, 1000);
                 setTimeout(() => {
                     this._hfPollDownloadStatus(jobId);
                 }, 500);
@@ -406,6 +439,7 @@ const extension = {
                     return;
                 }
 
+                this._hfProgressPercent = 0;
                 this._hfCurrentJobId = jobId;
                 this._hfSetStatus(`📥 Download iniciado (job ${jobId})`, "#1a73e8");
                 this.title = `🤗 HF 📥 0%`;
@@ -418,7 +452,7 @@ const extension = {
 
                 this._hfPollTimer = setInterval(() => {
                     this._hfPollDownloadStatus(jobId);
-                }, 1500);
+                }, 1000);
 
                 // Faz uma consulta imediata também
                 setTimeout(() => {
@@ -476,6 +510,8 @@ const extension = {
                 else if (status === "done" || status === "exists") {
                     percent = 100;
                 }
+
+                this._hfProgressPercent = percent;
 
                 // ========== ATUALIZA TÍTULO COM % ==========
                 let titleText = "";
@@ -748,7 +784,7 @@ const extension = {
             if (t.includes("vision")) return "clip_vision";
             if (t.includes("style")) return "style_models";
             if (t.includes("gligen")) return "gligen";
-            if (t.includes("unet")) return "diffusion_models";
+            if (t.includes("unet") || t.includes("diffusion") || w.includes("unet")) return "diffusion_models";
             if (t.includes("photomaker")) return "photomaker";
             if (t.includes("insight")) return "insightface";
             if (t.includes("animate")) return "animatediff_models";

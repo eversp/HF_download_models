@@ -1,6 +1,7 @@
 """HF Model Downloader — Custom Node para ComfyUI."""
 
 import os
+import sys
 import uuid
 import threading
 import time
@@ -105,6 +106,18 @@ def _parse_model_list(model_list: str) -> list:
     return refs
 
 
+def _print_progress(label: str, pct: int, bar_width: int = 30, done: bool = False):
+    """Desenha uma barra de progresso inline no terminal usando \\r."""
+    pct = max(0, min(100, pct))
+    filled = int(bar_width * pct / 100)
+    bar = "█" * filled + "░" * (bar_width - filled)
+    line = f"\r[HF Node] 📥 {label}: [{bar}] {pct}%"
+    sys.stdout.write(line + "   ")
+    if done or pct >= 100:
+        sys.stdout.write("\n")
+    sys.stdout.flush()
+
+
 # ============================================================
 # DownloadManager — gerencia downloads em background
 # ============================================================
@@ -166,8 +179,11 @@ class DownloadManager:
         return job_id
 
     def _run_job(self, job_id: str, model_refs: list, models_path: str):
-        """Executa os downloads em background."""
+        """Executa os downloads em background com barra de progresso."""
         try:
+            import comfy.utils
+            pbar = comfy.utils.ProgressBar(100)
+
             dl = _get_downloader(models_path)
             if not dl:
                 self._update_job(job_id, status="failed", error="Pasta models não encontrada!")
@@ -189,7 +205,6 @@ class DownloadManager:
 
             results = []
             for idx, m in enumerate(missing):
-                # Verifica cancelamento antes de cada modelo
                 cancel_event = self._cancel_events.get(job_id)
                 if cancel_event and cancel_event.is_set():
                     print(f"[HF Node] ⛔ Job {job_id} cancelado durante lote")
@@ -199,7 +214,36 @@ class DownloadManager:
                 self._update_job(job_id, current=current_msg,
                                  progress=f"{idx}/{total}")
 
-                downloaded = dl.download_missing_model(m, search_first=True)
+                # Callback de progresso por byte para este arquivo
+                def _make_file_callback(file_idx, total_files, filename):
+                    last_pct = [0]
+                    def _cb(downloaded_bytes, total_bytes):
+                        if cancel_event and cancel_event.is_set():
+                            return
+                        file_pct = (downloaded_bytes / total_bytes * 100) if total_bytes > 0 else 0
+                        overall_pct = int(((file_idx + file_pct / 100) / total_files) * 100) if total_files > 0 else 0
+                        overall_pct = max(0, min(100, overall_pct))
+                        try:
+                            pbar.update_absolute(overall_pct)
+                        except Exception:
+                            pass
+                        cur_pct = int(file_pct) if total_bytes > 0 else 0
+                        if cur_pct != last_pct[0] or cur_pct >= 100:
+                            last_pct[0] = cur_pct
+                            _print_progress(filename, cur_pct)
+                        with _download_manager._lock:
+                            if job_id in _download_manager._jobs:
+                                _download_manager._jobs[job_id]["bytes_downloaded"] = downloaded_bytes
+                                _download_manager._jobs[job_id]["bytes_total"] = total_bytes
+                    return _cb
+
+                file_callback = _make_file_callback(idx, total, m.filename)
+
+                downloaded = dl.download_missing_model(
+                    m, search_first=True,
+                    progress_callback=file_callback,
+                    cancel_event=cancel_event,
+                )
                 if downloaded:
                     results.append({
                         "filename": m.filename,
@@ -490,8 +534,11 @@ try:
 
 
     def _run_url_download_job(job_id: str, url: str, destination_folder: str, dl):
-        """Executa download de URL em background com suporte a cancelamento."""
+        """Executa download de URL em background com barra de progresso e suporte a cancelamento."""
         try:
+            import comfy.utils
+            pbar = comfy.utils.ProgressBar(100)
+
             parsed = HFDownloader.parse_hf_url(url)
 
             if not parsed:
@@ -517,11 +564,17 @@ try:
                     _download_manager._jobs[job_id]["bytes_downloaded"] = 0
                     _download_manager._jobs[job_id]["bytes_total"] = 0
 
-            # Progress callback: atualiza bytes em tempo real no job
+            # Progress callback: atualiza ProgressBar, terminal bar e job
             def _progress_callback(downloaded_bytes, total_bytes):
-                # Se foi cancelado, não atualiza mais
                 if cancel_event and cancel_event.is_set():
                     return
+                pct = int((downloaded_bytes / total_bytes * 100)) if total_bytes > 0 else 0
+                pct = max(0, min(100, pct))
+                try:
+                    pbar.update_absolute(pct)
+                except Exception:
+                    pass
+                _print_progress(filename, pct)
                 with _download_manager._lock:
                     if job_id in _download_manager._jobs:
                         _download_manager._jobs[job_id]["bytes_downloaded"] = downloaded_bytes
@@ -533,6 +586,9 @@ try:
                 progress_callback=_progress_callback,
                 cancel_event=cancel_event,
             )
+
+            # Finaliza a barra de progresso
+            _print_progress(filename, 100, done=True)
 
             # Se foi cancelado, não atualiza resultado (já foi marcado como cancelled)
             if cancel_event and cancel_event.is_set():
