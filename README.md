@@ -39,7 +39,7 @@ Nunca mais perca tempo caçando modelos manualmente. O **HF Model Downloader** v
 ```bash
 # 1. Clone na pasta custom_nodes do seu ComfyUI
 cd SEU_COMFYUI/custom_nodes
-git clone https://github.com/Ever-brsp/HF_downlosad_models.git
+git clone https://github.com/eversp/HF_download_models.git
 
 # 2. Instale as dependências (com o Python do ComfyUI)
 ./python_embeded/python.exe -m pip install -r requirements.txt
@@ -105,7 +105,7 @@ Never manually hunt for missing models again. **HF Model Downloader** scans your
 ```bash
 # 1. Clone into your ComfyUI custom_nodes folder
 cd YOUR_COMFYUI/custom_nodes
-git clone https://github.com/Ever-brsp/HF_downlosad_models.git
+git clone https://github.com/eversp/HF_download_models.git
 
 # 2. Install dependencies (using ComfyUI's Python)
 ./python_embeded/python.exe -m pip install -r requirements.txt
