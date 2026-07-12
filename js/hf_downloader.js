@@ -37,6 +37,7 @@ const NODE_CATEGORY = {
     "AnimateDiffLoader": "animatediff_models", "AnimateDiffLoaderV1": "animatediff_models",
     "AnimateDiffLoraLoader": "animatediff_motion_lora", "AnimateDiffMotionLoraLoader": "animatediff_motion_lora",
     "HypernetworkLoader": "embeddings",
+    "JanusModelLoader": "janus-pro",
 };
 
 // Widgets que contêm modelos em cada tipo de nó
@@ -54,6 +55,7 @@ const NODE_WIDGETS = {
     "AnimateDiffLoader": ["model_name"], "AnimateDiffLoaderV1": ["model_name"],
     "AnimateDiffLoraLoader": ["lora_name"], "AnimateDiffMotionLoraLoader": ["lora_name"],
     "HypernetworkLoader": ["model_name"],
+    "JanusModelLoader": ["model_name"],
 };
 
 const STORAGE_KEY = "hf_node_models_path";
@@ -739,8 +741,11 @@ const extension = {
                         if (!val || val === "undefined" || val === "none") continue;
                         // 🔥 FILTRO: ignora URLs (http/https) — não são nomes de modelo
                         if (/^https?:\/\//i.test(val)) continue;
-                        // 🔥 Extrai só o nome do arquivo se for caminho/URL parcial
-                        val = val.split('/').pop().split('\\').pop();
+                        // 🔥 Normaliza caminho, preserva subpasta relativa
+                        val = val.replace(/\\/g, '/');
+                        val = val.replace(/^https?:\/\/[^\/]+\//i, '');
+                        val = val.replace(/^[a-zA-Z]:\//, '');
+                        val = val.replace(/^\//, '');
                         if (!val) continue;
                         if (!models.some(m => m.name === val && m.cat === category)) {
                             models.push({ name: val, cat: category });
@@ -754,8 +759,11 @@ const extension = {
                         if (!val || val === "undefined" || val === "none") continue;
                         // 🔥 FILTRO: ignora URLs (http/https) — não são nomes de modelo
                         if (/^https?:\/\//i.test(val)) continue;
-                        // 🔥 Extrai só o nome do arquivo se for caminho/URL parcial
-                        val = val.split('/').pop().split('\\').pop();
+                        // 🔥 Normaliza caminho, preserva subpasta relativa
+                        val = val.replace(/\\/g, '/');
+                        val = val.replace(/^https?:\/\/[^\/]+\//i, '');
+                        val = val.replace(/^[a-zA-Z]:\//, '');
+                        val = val.replace(/^\//, '');
                         if (!val) continue;
                         const hasExt = MODEL_FILE_EXTENSIONS.some(ext => val.toLowerCase().endsWith(ext));
                         if (hasExt && !models.some(m => m.name === val)) {

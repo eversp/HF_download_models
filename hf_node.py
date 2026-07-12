@@ -208,8 +208,12 @@ class HFModelDownloaderNode:
                 fname = os.path.basename(fname.split('?')[0])
                 print(f"[HF Node] ⚠️ URL detectada em model_list, extraindo: {fname}")
             
-            # 🔥 Remove caminhos (se veio como path completo)
-            fname = fname.replace('\\', '/').rsplit('/', 1)[-1]
+            # 🔥 Normaliza separadores (preserva subpasta)
+            fname = fname.replace('\\', '/')
+            if fname.startswith('/'):
+                fname = fname.lstrip('/')
+            if len(fname) > 1 and fname[1] == ':':
+                fname = fname.split(':', 1)[-1].lstrip('/').lstrip('\\')
             
             if fname:
                 refs.append({"category": cat, "filename": fname})

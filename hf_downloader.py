@@ -67,55 +67,105 @@ class HFDownloader:
         except Exception:
             return None
 
-    # --- Scan de modelos (RESPEITA SYMLINKS e extra_model_paths.yaml!) ---
+    # --- Scan de modelos (RESPEITA SYMLINKS, extra_model_paths.yaml e SUBPASTAS!) ---
     def _file_exists_comfy(self, folder_name: str, filename: str) -> bool:
         """
         Verifica existência usando a API oficial do ComfyUI.
-        Respeita symlinks, extra_model_paths.yaml, múltiplas pastas.
-        Design original — 4 passos diretos, sem helpers desnecessários.
+        Respeita symlinks, extra_model_paths.yaml, múltiplas pastas e SUBPASTAS.
+        Se o filename tem subpasta (ex: 'anime/style.safetensors'), tenta o path
+        completo primeiro. Se não achar, busca recursivamente pela basename.
         """
-        # 1. folder_paths.get_full_path() — API oficial do ComfyUI (resolve tudo)
-        try:
-            import folder_paths
-            resolved = folder_paths.get_full_path(folder_name, filename)
-            if resolved and os.path.exists(resolved):
-                return True
-        except Exception:
-            pass
+        normalized = filename.replace('\\', '/')
+        base_only = normalized.rsplit('/', 1)[-1] if '/' in normalized else normalized
+        has_subfolder = '/' in normalized
 
-        # 2. os.path.realpath() — resolve symlinks manualmente
-        try:
-            candidate = os.path.join(str(self._comfyui_models_path), folder_name, filename)
-            real = os.path.realpath(candidate)
-            if real != candidate and os.path.exists(real):
+        # ── Helper: tenta path montado ──
+        def _try_path(folder: str, fname: str) -> bool:
+            try:
+                import folder_paths
+                resolved = folder_paths.get_full_path(folder, fname)
+                if resolved and os.path.exists(resolved):
+                    return True
+            except Exception:
+                pass
+            try:
+                candidate = os.path.join(str(self._comfyui_models_path), folder, fname)
+                real = os.path.realpath(candidate)
+                if real != candidate and os.path.exists(real):
+                    return True
+            except Exception:
+                pass
+            direct = self._comfyui_models_path / folder / fname
+            if direct.exists():
                 return True
-        except Exception:
-            pass
+            # ── Verifica se é diretório (modelo repo-style: transformers/diffusers) ──
+            try:
+                import folder_paths
+                for base in folder_paths.get_folder_paths(folder):
+                    dir_candidate = os.path.join(base, fname)
+                    if os.path.isdir(dir_candidate):
+                        return True
+            except Exception:
+                pass
+            dir_candidate = self._comfyui_models_path / folder / fname
+            if dir_candidate.is_dir():
+                return True
+            return False
 
-        # 3. Verificação direta (fallback)
-        direct = self._comfyui_models_path / folder_name / filename
-        if direct.exists():
+        # ── Helper: busca recursiva pela basename na pasta da categoria ──
+        def _search_recursive(folder: str, base: str) -> bool:
+            root = str(self._comfyui_models_path / folder)
+            if not os.path.isdir(root):
+                return False
+            # Gera variações de nome com extensões
+            names_to_match = {base}
+            if not any(base.lower().endswith(ext) for ext in MODEL_EXTENSIONS):
+                for ext in MODEL_EXTENSIONS:
+                    names_to_match.add(base + ext)
+            for dirpath, _, files in os.walk(root):
+                for f in files:
+                    if f in names_to_match:
+                        return True
+            return False
+
+        # 1. Tenta o path completo (com subpasta se houver)
+        if _try_path(folder_name, normalized):
             return True
 
-        # 4. Tenta sem extensão (modelos sem .safetensors/.ckpt no nome)
-        if not any(filename.lower().endswith(ext) for ext in MODEL_EXTENSIONS):
+        # 2. Se tem subpasta, tenta também sem (pode estar na raiz)
+        if has_subfolder:
+            if _try_path(folder_name, base_only):
+                return True
+
+        # 3. Se não tem subpasta, tenta com extensões alternativas
+        if not has_subfolder and not any(normalized.lower().endswith(ext) for ext in MODEL_EXTENSIONS):
             for ext in MODEL_EXTENSIONS:
-                try:
-                    import folder_paths
-                    resolved = folder_paths.get_full_path(folder_name, filename + ext)
-                    if resolved and os.path.exists(resolved):
-                        return True
-                except Exception:
-                    pass
-                alt = self._comfyui_models_path / folder_name / (filename + ext)
-                if alt.exists():
+                if _try_path(folder_name, normalized + ext):
                     return True
-                try:
-                    real = os.path.realpath(str(alt))
-                    if os.path.exists(real):
+
+        # 4. Verifica se é repositório (modelo transformers/diffusers ex: Janus-Pro)
+        if self._is_repo_id(normalized):
+            repo_name = normalized.rsplit('/', 1)[-1]
+            # Usa a CHAVE do folder_paths pra consultar paths registrados
+            folder_key = self._resolve_comfy_folder(folder_name)
+            try:
+                import folder_paths
+                for base in folder_paths.get_folder_paths(folder_key):
+                    dir_candidate = os.path.join(base, repo_name)
+                    if os.path.isdir(dir_candidate):
                         return True
-                except Exception:
-                    pass
+            except Exception:
+                pass
+            # Verifica também no path principal com o basename real
+            real_folder = self._resolve_folder_basename(folder_name)
+            dir_candidate = self._comfyui_models_path / real_folder / repo_name
+            if dir_candidate.is_dir():
+                return True
+            return False
+
+        # 5. Busca recursiva em subpastas pela basename
+        if _search_recursive(folder_name, base_only):
+            return True
 
         return False
 
@@ -133,39 +183,47 @@ class HFDownloader:
                 print(f"[HF Node] ⚠️ Ignorando URL-like filename: {filename}")
                 continue
 
+            # Normaliza separadores (subpasta já deve estar preservada)
+            filename = filename.replace('\\', '/')
+
             # Resolve o nome da pasta usando folder_paths nativo do ComfyUI
             comfy_folder = self._resolve_comfy_folder(category)
 
             if not self._file_exists_comfy(comfy_folder, filename):
+                # Para repos, o full_path correto usa o basename (sem author prefix)
+                if self._is_repo_id(filename):
+                    real_folder = self._resolve_folder_basename(category)
+                    repo_name = filename.rsplit('/', 1)[-1]
+                    display_path = str(self._comfyui_models_path / real_folder / repo_name)
+                else:
+                    display_path = str(self._comfyui_models_path / comfy_folder / filename)
                 missing.append(MissingModel(
                     filename=filename, category=category,
                     comfy_folder=comfy_folder,
-                    full_path=str(self._comfyui_models_path / comfy_folder / filename),
+                    full_path=display_path,
                 ))
         return missing
 
     @staticmethod
     def _resolve_comfy_folder(category: str) -> str:
-        """Resolve o nome da pasta ComfyUI a partir de uma categoria.
+        """Resolve a CHAVE do folder_paths a partir de uma categoria.
         
         Usa folder_paths.folder_names_and_paths como fonte autoritativa.
+        Retorna o KEY do dict (ex: 'janus-pro'), NÃO o basename do path real.
         Aplica map_legacy() para compatibilidade com nomes antigos (ex: 'unet' → 'diffusion_models').
         """
         try:
             import folder_paths
             known = folder_paths.folder_names_and_paths
-            # Aplica map_legacy primeiro (ex: 'unet' → 'diffusion_models', 'clip' → 'text_encoders')
             mapped = folder_paths.map_legacy(category)
             if mapped in known:
                 return mapped
             if category in known:
                 return category
-            # Tenta com 's' (ex: lora → loras)
             if category + "s" in known:
                 return category + "s"
         except Exception:
             pass
-        # Fallback completo — cobre TODAS as categorias que o frontend pode enviar
         FALLBACK = {
             "checkpoint": "checkpoints",
             "checkpoints": "checkpoints",
@@ -189,8 +247,28 @@ class HFDownloader:
             "animatediff_models": "animatediff_models",
             "animatediff_motion_lora": "animatediff_motion_lora",
             "hypernetwork": "embeddings",
+            "janus-pro": "janus-pro",
+            "Janus-Pro": "janus-pro",
         }
         return FALLBACK.get(category, FALLBACK.get(category + "s", "checkpoints"))
+
+    @staticmethod
+    def _resolve_folder_basename(category: str) -> str:
+        """Extrai o NOME REAL da pasta no disco a partir da chave folder_paths.
+        
+        Ex: chave 'janus-pro' → path registrado 'E:\\1-IA\\models\\Janus-Pro' → basename 'Janus-Pro'
+        Isso garante que o path de download CASE EXATO que o nó hardcodeia.
+        Universal: funciona em Windows (case-insensitive) e Linux (case-sensitive).
+        """
+        try:
+            import folder_paths
+            key = HFDownloader._resolve_comfy_folder(category)
+            paths = folder_paths.get_folder_paths(key)
+            if paths:
+                return os.path.basename(os.path.normpath(paths[0]))
+        except Exception:
+            pass
+        return category
 
     # --- Busca ---
     def search_models(self, query: str, limit: int = 20) -> List[ModelInfo]:
@@ -612,8 +690,14 @@ class HFDownloader:
         """Invalida o cache do folder_paths do ComfyUI para forçar redetecção."""
         try:
             import folder_paths
-            # Determina o nome da pasta (ex: "loras", "checkpoints")
-            folder_name = os.path.basename(folder_path.rstrip("/").rstrip("\\"))
+            # Extrai só a pasta raiz da categoria (ignora subpastas)
+            folder_path = folder_path.rstrip("/").rstrip("\\")
+            models_root = str(self._comfyui_models_path).rstrip("/").rstrip("\\")
+            if folder_path.startswith(models_root):
+                relative = folder_path[len(models_root):].lstrip("/").lstrip("\\")
+                folder_name = relative.split("/")[0].split("\\")[0]
+            else:
+                folder_name = os.path.basename(folder_path)
             # Mapeia nomes legacy (ex: "unet" → "diffusion_models")
             folder_name = folder_paths.map_legacy(folder_name)
             # Limpa o cache
@@ -624,10 +708,99 @@ class HFDownloader:
         except Exception:
             pass  # Não crítico — o modelo eventualmente aparece
 
+    @staticmethod
+    def _is_repo_id(filename: str) -> bool:
+        """Detecta se filename é um HuggingFace repo ID (ex: 'deepseek-ai/Janus-Pro-1B')."""
+        normalized = filename.replace('\\', '/')
+        if '/' not in normalized:
+            return False
+        last_part = normalized.rsplit('/', 1)[-1]
+        # Se a última parte tem extensão de modelo, é arquivo com subpasta
+        if any(last_part.lower().endswith(ext) for ext in MODEL_EXTENSIONS):
+            return False
+        return True
+
+    def _download_repo(self, repo_id: str, destination_base: str,
+                        progress_callback=None, cancel_event: threading.Event = None) -> str | None:
+        """
+        Baixa um repositório completo do HuggingFace via snapshot_download().
+        Usado para modelos transformers/diffusers (ex: Janus-Pro, LLM, etc).
+        
+        Args:
+            repo_id: ID do repositório (ex: "deepseek-ai/Janus-Pro-1B")
+            destination_base: Pasta base (ex: models/Janus-Pro)
+            progress_callback: Função opcional chamada com (downloaded_bytes, total_bytes)
+            cancel_event: threading.Event — se setado, o download é abortado.
+        
+        Retorna o caminho do diretório baixado, ou None se falhar.
+        """
+        import shutil
+        try:
+            repo_name = repo_id.rsplit('/', 1)[-1]
+            dest_dir = os.path.join(destination_base, repo_name)
+
+            if os.path.isdir(dest_dir) and os.path.exists(os.path.join(dest_dir, "config.json")):
+                print(f"[HF Node] ✅ Repositório já existe: {dest_dir}")
+                self._invalidate_comfy_cache(destination_base)
+                return dest_dir
+
+            os.makedirs(destination_base, exist_ok=True)
+            print(f"[HF Node] 📥 Snapshot: {repo_id} → {dest_dir}")
+
+            from huggingface_hub import snapshot_download
+
+            download_result = [None]
+            download_error = [None]
+
+            def _do_snapshot():
+                try:
+                    path = snapshot_download(
+                        repo_id=repo_id,
+                        local_dir=dest_dir,
+                        local_dir_use_symlinks=False,
+                        token=self._token,
+                        resume_download=True,
+                    )
+                    download_result[0] = path
+                except Exception as e:
+                    download_error[0] = e
+
+            dl_thread = threading.Thread(target=_do_snapshot, daemon=True)
+            dl_thread.start()
+
+            while dl_thread.is_alive():
+                if cancel_event and cancel_event.is_set():
+                    print(f"[HF Node] ⛔ Snapshot cancelado: {repo_id}")
+                    if os.path.isdir(dest_dir):
+                        shutil.rmtree(dest_dir, ignore_errors=True)
+                    return None
+                dl_thread.join(timeout=1.0)
+
+            if download_error[0]:
+                raise download_error[0]
+
+            if download_result[0]:
+                print(f"[HF Node] ✅ Snapshot concluído: {repo_name}")
+                self._invalidate_comfy_cache(destination_base)
+                return dest_dir
+
+            return None
+
+        except Exception as e:
+            print(f"[HF Node] Erro snapshot {repo_id}: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
     def download_missing_model(self, missing: MissingModel, search_first: bool = True,
-                                 progress_callback=None, cancel_event: threading.Event = None) -> str | None:
+                                  progress_callback=None, cancel_event: threading.Event = None) -> str | None:
         """
         Baixa um modelo faltante. Retorna o caminho absoluto se sucesso, None se falha.
+        
+        Suporta:
+        - Arquivo único (ex: 'style.safetensors')
+        - Arquivo com subpasta (ex: 'anime/style.safetensors')
+        - Repositório completo do HF (ex: 'deepseek-ai/Janus-Pro-1B')
         
         Args:
             missing: MissingModel com filename, category, comfy_folder, full_path
@@ -635,18 +808,36 @@ class HFDownloader:
             progress_callback: Função opcional chamada com (downloaded_bytes, total_bytes)
             cancel_event: threading.Event — se setado, o download é abortado.
         """
-        destination = str(self._comfyui_models_path / missing.comfy_folder)
+        normalized = missing.filename.replace('\\', '/')
+
+        # ── Caso 1: Repositório completo (ex: "deepseek-ai/Janus-Pro-1B") ──
+        if self._is_repo_id(normalized):
+            real_folder = self._resolve_folder_basename(missing.category)
+            destination_base = str(self._comfyui_models_path / real_folder)
+            return self._download_repo(
+                normalized, destination_base,
+                progress_callback=progress_callback, cancel_event=cancel_event,
+            )
+
+        # ── Caso 2: Arquivo com ou sem subpasta ──
+        if '/' in normalized:
+            subfolder = normalized.rsplit('/', 1)[0]
+            file_only = normalized.rsplit('/', 1)[-1]
+            destination = str(self._comfyui_models_path / missing.comfy_folder / subfolder)
+        else:
+            file_only = normalized
+            destination = str(self._comfyui_models_path / missing.comfy_folder)
 
         if search_first:
-            model_id = self.search_best_match(missing.filename)
+            model_id = self.search_best_match(file_only)
             if not model_id:
-                print(f"[HF Node] ❌ Não encontrou '{missing.filename}' no HF")
+                print(f"[HF Node] ❌ Não encontrou '{file_only}' no HF")
                 return None
         else:
             model_id = missing.filename
 
         return self.download_single_file(
-            model_id, missing.filename, destination,
+            model_id, file_only, destination,
             progress_callback=progress_callback, cancel_event=cancel_event,
         )
 
